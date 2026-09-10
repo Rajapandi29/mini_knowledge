@@ -1,0 +1,139 @@
+name: Docker Compose CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+  pull_request:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1
+
+  STREAMLIT_ECR_REPOSITORY: streamlit-app
+  FASTAPI_ECR_REPOSITORY: fastapi-app
+
+  ECS_CLUSTER: rag-app-cluster
+
+  STREAMLIT_ECS_SERVICE: streamlit-service
+  FASTAPI_ECS_SERVICE: fastapi-service
+
+  STREAMLIT_ECS_TASK_DEFINITION: streamlit-task
+  FASTAPI_ECS_TASK_DEFINITION: fastapi-task
+
+  STREAMLIT_CONTAINER_NAME: streamlit-container
+  FASTAPI_CONTAINER_NAME: fastapi-container
+
+
+jobs:
+
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+
+      - name: AWS Login
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+
+      - name: AWS ECR Login
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+
+      - name: Set image tags
+        run: |
+          echo "STREAMLIT_ECR_IMAGE_TAG=${GITHUB_SHA}" >> $GITHUB_ENV
+          echo "FASTAPI_ECR_IMAGE_TAG=${GITHUB_SHA}" >> $GITHUB_ENV
+
+
+
+      - name: Build Streamlit image
+        run: |
+          docker build \
+            -t ${{ steps.ecr-login.outputs.registry }}/${{ env.STREAMLIT_ECR_REPOSITORY }}:${{ env.STREAMLIT_ECR_IMAGE_TAG }} \
+            -f Dockerfile.streamlit .
+
+
+      - name: Push Streamlit image
+        run: |
+          docker push \
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.STREAMLIT_ECR_REPOSITORY }}:${{ env.STREAMLIT_ECR_IMAGE_TAG }}
+
+
+
+      - name: Build FastAPI image
+        run: |
+          docker build \
+            -t ${{ steps.ecr-login.outputs.registry }}/${{ env.FASTAPI_ECR_REPOSITORY }}:${{ env.FASTAPI_ECR_IMAGE_TAG }} \
+            -f Dockerfile.fastapi .
+
+
+      - name: Push FastAPI image
+        run: |
+          docker push \
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.FASTAPI_ECR_REPOSITORY }}:${{ env.FASTAPI_ECR_IMAGE_TAG }}
+
+
+
+      - name: Download Streamlit task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.STREAMLIT_ECS_TASK_DEFINITION }} \
+            --query taskDefinition \
+            --output json > streamlit-task.json
+
+
+      - name: Update Streamlit task definition
+        id: streamlit-task
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: streamlit-task.json
+          container-name: ${{ env.STREAMLIT_CONTAINER_NAME }}
+          image: ${{ steps.ecr-login.outputs.registry }}/${{ env.STREAMLIT_ECR_REPOSITORY }}:${{ env.STREAMLIT_ECR_IMAGE_TAG }}
+
+
+      - name: Deploy Streamlit to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.streamlit-task.outputs.task-definition }}
+          service: ${{ env.STREAMLIT_ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+
+
+      - name: Download FastAPI task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.FASTAPI_ECS_TASK_DEFINITION }} \
+            --query taskDefinition \
+            --output json > fastapi-task.json
+
+
+      - name: Update FastAPI task definition
+        id: fastapi-task
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: fastapi-task.json
+          container-name: ${{ env.FASTAPI_CONTAINER_NAME }}
+          image: ${{ steps.ecr-login.outputs.registry }}/${{ env.FASTAPI_ECR_REPOSITORY }}:${{ env.FASTAPI_ECR_IMAGE_TAG }}
+
+
+      - name: Deploy FastAPI to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.fastapi-task.outputs.task-definition }}
+          service: ${{ env.FASTAPI_ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true

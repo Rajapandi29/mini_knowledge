@@ -1,8 +1,8 @@
-name: First Docker Build and ECR Push
+name: Docker Build Push and ECS Deploy
 
 on:
   push:
-    /branches:
+    branches:
       - main
 
 env:
@@ -11,8 +11,19 @@ env:
   STREAMLIT_ECR_REPOSITORY: rag-app-streamlit
   FASTAPI_ECR_REPOSITORY: rag-app-fastapi
 
+  ECS_CLUSTER: rag-app-cluster
+
+  STREAMLIT_ECS_SERVICE: streamlit-service
+  FASTAPI_ECS_SERVICE: fastapi-service
+
+  STREAMLIT_CONTAINER_NAME: streamlit-container
+  FASTAPI_CONTAINER_NAME: fastapi-container
+
+  STREAMLIT_TASK_FAMILY: rag-app-streamlit
+  FASTAPI_TASK_FAMILY: rag-app-fastapi
+
 jobs:
-  build-and-push:
+  build-push-deploy:
     runs-on: ubuntu-latest
 
     steps:
@@ -68,10 +79,184 @@ jobs:
           docker push \
             ${{ steps.ecr-login.outputs.registry }}/${{ env.FASTAPI_ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
 
-      - name: Show pushed images
+      - name: Get ECS task execution role
+        id: execution-role
         run: |
-          echo "Streamlit image:"
-          echo "${{ steps.ecr-login.outputs.registry }}/${{ env.STREAMLIT_ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}"
-          echo "FastAPI image:"
-          echo "${{ steps.ecr-login.outputs.registry }}/${{ env.FASTAPI_ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}"
+          ROLE_ARN=$(aws iam get-role \
+            --role-name ecsTaskExecutionRole \
+            --query 'Role.Arn' \
+            --output text)
 
+          echo "ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV
+
+      - name: Create Streamlit task definition
+        run: |
+          cat > streamlit-task.json <<EOF
+          {
+            "family": "${{ env.STREAMLIT_TASK_FAMILY }}",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": [
+              "FARGATE"
+            ],
+            "cpu": "256",
+            "memory": "512",
+            "executionRoleArn": "${{ env.ROLE_ARN }}",
+            "containerDefinitions": [
+              {
+                "name": "${{ env.STREAMLIT_CONTAINER_NAME }}",
+                "image": "${{ steps.ecr-login.outputs.registry }}/${{ env.STREAMLIT_ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}",
+                "essential": true,
+                "portMappings": [
+                  {
+                    "containerPort": 8501,
+                    "hostPort": 8501,
+                    "protocol": "tcp"
+                  }
+                ],
+                "command": [
+                  "streamlit",
+                  "run",
+                  "frontend/streamlit_app.py",
+                  "--server.address=0.0.0.0",
+                  "--server.port=8501"
+                ],
+                "environment": [
+                  {
+                    "name": "BACKEND_URL",
+                    "value": "/backend"
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
+
+      - name: Register Streamlit task definition
+        id: streamlit-register
+        run: |
+          STREAMLIT_TASK_DEFINITION=$(aws ecs register-task-definition \
+            --cli-input-json file://streamlit-task.json \
+            --region ${{ env.AWS_REGION }} \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "STREAMLIT_TASK_DEFINITION=$STREAMLIT_TASK_DEFINITION" >> $GITHUB_ENV
+
+      - name: Create FastAPI task definition
+        run: |
+          cat > fastapi-task.json <<EOF
+          {
+            "family": "${{ env.FASTAPI_TASK_FAMILY }}",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": [
+              "FARGATE"
+            ],
+            "cpu": "512",
+            "memory": "1024",
+            "executionRoleArn": "${{ env.ROLE_ARN }}",
+            "containerDefinitions": [
+              {
+                "name": "${{ env.FASTAPI_CONTAINER_NAME }}",
+                "image": "${{ steps.ecr-login.outputs.registry }}/${{ env.FASTAPI_ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}",
+                "essential": true,
+                "portMappings": [
+                  {
+                    "containerPort": 8000,
+                    "hostPort": 8000,
+                    "protocol": "tcp"
+                  }
+                ],
+                "command": [
+                  "uvicorn",
+                  "main:app",
+                  "--host",
+                  "0.0.0.0",
+                  "--port",
+                  "8000"
+                ],
+                "environment": [
+                  {
+                    "name": "DATABASE_URL",
+                    "value": "${{ secrets.NEON_DATABASE_URL }}"
+                  },
+                  {
+                    "name": "POSTGRES_DB",
+                    "value": "${{ secrets.NEON_DATABASE_NAME }}"
+                  },
+                  {
+                    "name": "POSTGRES_USER",
+                    "value": "${{ secrets.NEON_DATABASE_USER }}"
+                  },
+                  {
+                    "name": "POSTGRES_PASSWORD",
+                    "value": "${{ secrets.NEON_DATABASE_PASSWORD }}"
+                  },
+                  {
+                    "name": "PORT",
+                    "value": "8000"
+                  }
+                ],
+                "healthCheck": {
+                  "command": [
+                    "CMD-SHELL",
+                    "curl -f http://localhost:8000/health || exit 1"
+                  ],
+                  "interval": 30,
+                  "timeout": 5,
+                  "retries": 3,
+                  "startPeriod": 60
+                }
+              }
+            ]
+          }
+          EOF
+
+      - name: Register FastAPI task definition
+        id: fastapi-register
+        run: |
+          FASTAPI_TASK_DEFINITION=$(aws ecs register-task-definition \
+            --cli-input-json file://fastapi-task.json \
+            --region ${{ env.AWS_REGION }} \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "FASTAPI_TASK_DEFINITION=$FASTAPI_TASK_DEFINITION" >> $GITHUB_ENV
+
+      - name: Deploy Streamlit service
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.STREAMLIT_ECS_SERVICE }} \
+            --task-definition ${{ env.STREAMLIT_TASK_DEFINITION }} \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Deploy FastAPI service
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.FASTAPI_ECS_SERVICE }} \
+            --task-definition ${{ env.FASTAPI_TASK_FAMILY }} \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Wait for Streamlit service
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.STREAMLIT_ECS_SERVICE }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Wait for FastAPI service
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.FASTAPI_ECS_SERVICE }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Show deployed images
+        run: |
+          echo "Streamlit:"
+          echo "${{ steps.ecr-login.outputs.registry }}/${{ env.STREAMLIT_ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}"
+          echo "FastAPI:"
+          echo "${{ steps.ecr-login.outputs.registry }}/${{ env.FASTAPI_ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}"

@@ -8,28 +8,45 @@ on:
 env:
   AWS_REGION: us-east-1
 
+  # ECR repositories
   STREAMLIT_ECR_REPOSITORY: rag-app-streamlit
   FASTAPI_ECR_REPOSITORY: rag-app-fastapi
 
+  # ECS cluster
   ECS_CLUSTER: rag-app-cluster
 
+  # ECS services
   STREAMLIT_ECS_SERVICE: rag-app-streamlit
   FASTAPI_ECS_SERVICE: rag-app-fastapi
 
+  # ECS container names
   STREAMLIT_CONTAINER_NAME: streamlit
   FASTAPI_CONTAINER_NAME: fastapi
 
+  # ECS task definition families
   STREAMLIT_TASK_FAMILY: rag-app-streamlit
   FASTAPI_TASK_FAMILY: rag-app-fastapi
 
+  # Always use latest
+  IMAGE_TAG: latest
+
 jobs:
   build-push-deploy:
+    name: Build Push and Deploy
     runs-on: ubuntu-latest
 
     steps:
+
+      # ==========================================
+      # 1. Checkout code
+      # ==========================================
       - name: Checkout code
         uses: actions/checkout@v4
 
+
+      # ==========================================
+      # 2. Configure AWS credentials
+      # ==========================================
       - name: AWS Login
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -37,69 +54,105 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+
+      # ==========================================
+      # 3. Login to ECR
+      # ==========================================
       - name: AWS ECR Login
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Set image tag
-        run: |
-          echo "IMAGE_TAG=${GITHUB_SHA}" >> "$GITHUB_ENV"
 
+      # ==========================================
+      # 4. Check Streamlit ECR repository
+      # ==========================================
       - name: Check Streamlit ECR repository
         run: |
           aws ecr describe-repositories \
             --repository-names "$STREAMLIT_ECR_REPOSITORY" \
             --region "$AWS_REGION"
 
+
+      # ==========================================
+      # 5. Check FastAPI ECR repository
+      # ==========================================
       - name: Check FastAPI ECR repository
         run: |
           aws ecr describe-repositories \
             --repository-names "$FASTAPI_ECR_REPOSITORY" \
             --region "$AWS_REGION"
 
+
+      # ==========================================
+      # 6. Build Streamlit image
+      # ==========================================
       - name: Build Streamlit image
         run: |
           docker build \
             -t "${{ steps.ecr-login.outputs.registry }}/${{ env.STREAMLIT_ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}" \
             -f Dockerfile.streamlit .
 
+
+      # ==========================================
+      # 7. Push Streamlit image
+      # ==========================================
       - name: Push Streamlit image
         run: |
           docker push \
             "${{ steps.ecr-login.outputs.registry }}/${{ env.STREAMLIT_ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}"
 
+
+      # ==========================================
+      # 8. Build FastAPI image
+      # ==========================================
       - name: Build FastAPI image
         run: |
           docker build \
             -t "${{ steps.ecr-login.outputs.registry }}/${{ env.FASTAPI_ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}" \
             -f Dockerfile.fastapi .
 
+
+      # ==========================================
+      # 9. Push FastAPI image
+      # ==========================================
       - name: Push FastAPI image
         run: |
           docker push \
             "${{ steps.ecr-login.outputs.registry }}/${{ env.FASTAPI_ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}"
 
-      - name: Get Streamlit task definition
-        id: streamlit-task
+
+      # ==========================================
+      # STREAMLIT ECS
+      # ==========================================
+
+      # ==========================================
+      # 10. Download current Streamlit task definition
+      # ==========================================
+      - name: Download Streamlit task definition
         run: |
-          REVISION=$(aws ecs describe-task-definition \
+          aws ecs describe-task-definition \
             --task-definition "$STREAMLIT_TASK_FAMILY" \
-            --query 'taskDefinition.revision' \
-            --output text \
-            --region "$AWS_REGION")
+            --query taskDefinition \
+            --output json \
+            --region "$AWS_REGION" \
+            > streamlit-task-definition.json
 
-          echo "Streamlit task definition revision: $REVISION"
-          echo "revision=$REVISION" >> "$GITHUB_OUTPUT"
 
+      # ==========================================
+      # 11. Update Streamlit image to latest
+      # ==========================================
       - name: Render Streamlit task definition
         id: render-streamlit
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
-          task-definition-family: ${{ env.STREAMLIT_TASK_FAMILY }}
-          task-definition-revision: ${{ steps.streamlit-task.outputs.revision }}
+          task-definition: streamlit-task-definition.json
           container-name: ${{ env.STREAMLIT_CONTAINER_NAME }}
           image: ${{ steps.ecr-login.outputs.registry }}/${{ env.STREAMLIT_ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
 
+
+      # ==========================================
+      # 12. Deploy Streamlit
+      # ==========================================
       - name: Deploy Streamlit service
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
@@ -108,27 +161,39 @@ jobs:
           cluster: ${{ env.ECS_CLUSTER }}
           wait-for-service-stability: true
 
-      - name: Get FastAPI task definition
-        id: fastapi-task
+
+      # ==========================================
+      # FASTAPI ECS
+      # ==========================================
+
+      # ==========================================
+      # 13. Download current FastAPI task definition
+      # ==========================================
+      - name: Download FastAPI task definition
         run: |
-          REVISION=$(aws ecs describe-task-definition \
+          aws ecs describe-task-definition \
             --task-definition "$FASTAPI_TASK_FAMILY" \
-            --query 'taskDefinition.revision' \
-            --output text \
-            --region "$AWS_REGION")
+            --query taskDefinition \
+            --output json \
+            --region "$AWS_REGION" \
+            > fastapi-task-definition.json
 
-          echo "FastAPI task definition revision: $REVISION"
-          echo "revision=$REVISION" >> "$GITHUB_OUTPUT"
 
+      # ==========================================
+      # 14. Update FastAPI image to latest
+      # ==========================================
       - name: Render FastAPI task definition
         id: render-fastapi
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
-          task-definition-family: ${{ env.FASTAPI_TASK_FAMILY }}
-          task-definition-revision: ${{ steps.fastapi-task.outputs.revision }}
+          task-definition: fastapi-task-definition.json
           container-name: ${{ env.FASTAPI_CONTAINER_NAME }}
           image: ${{ steps.ecr-login.outputs.registry }}/${{ env.FASTAPI_ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
 
+
+      # ==========================================
+      # 15. Deploy FastAPI
+      # ==========================================
       - name: Deploy FastAPI service
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
@@ -137,9 +202,32 @@ jobs:
           cluster: ${{ env.ECS_CLUSTER }}
           wait-for-service-stability: true
 
+
+      # ==========================================
+      # 16. Show deployed images
+      # ==========================================
       - name: Show deployed images
         run: |
+          echo "=========================================="
+          echo "DEPLOYMENT COMPLETE"
+          echo "=========================================="
+
+          echo ""
           echo "Streamlit image:"
-          echo "${{ steps.ecr-login.outputs.registry }}/${{ env.STREAMLIT_ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}"
+          echo "${{ steps.ecr-login.outputs.registry }}/${{ env.STREAMLIT_ECR_REPOSITORY }}:latest"
+
+          echo ""
           echo "FastAPI image:"
-          echo "${{ steps.ecr-login.outputs.registry }}/${{ env.FASTAPI_ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}"
+          echo "${{ steps.ecr-login.outputs.registry }}/${{ env.FASTAPI_ECR_REPOSITORY }}:latest"
+
+          echo ""
+          echo "ECS Cluster:"
+          echo "$ECS_CLUSTER"
+
+          echo ""
+          echo "Streamlit Service:"
+          echo "$STREAMLIT_ECS_SERVICE"
+
+          echo ""
+          echo "FastAPI Service:"
+          echo "$FASTAPI_ECS_SERVICE"
